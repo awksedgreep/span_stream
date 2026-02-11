@@ -6,6 +6,15 @@ defmodule SpanStream.Index do
   @default_limit 100
   @default_offset 0
 
+  # Flush pending index operations after this interval
+  @index_flush_interval 100
+
+  # Batch INSERT up to 400 terms per statement (800 params, under SQLite's 999 limit)
+  @terms_batch_size 400
+
+  # Batch INSERT OR REPLACE up to 100 traces per statement (6 params each = 600)
+  @trace_batch_size 100
+
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -16,14 +25,29 @@ defmodule SpanStream.Index do
     GenServer.call(__MODULE__, {:index_block, block_meta, entries})
   end
 
+  @spec index_block_async(SpanStream.Writer.block_meta(), [map()]) :: :ok
+  def index_block_async(block_meta, entries) do
+    GenServer.cast(__MODULE__, {:index_block, block_meta, entries})
+  end
+
   @spec query(keyword()) :: {:ok, SpanStream.Result.t()}
   def query(filters) do
-    GenServer.call(__MODULE__, {:query, filters}, SpanStream.Config.query_timeout())
+    # Phase 1: GenServer does the cheap SQLite lookup only
+    {block_ids, storage, pagination, search_filters} =
+      GenServer.call(__MODULE__, {:query_plan, filters}, SpanStream.Config.query_timeout())
+
+    # Phase 2: Parallel decompression + filtering in the caller's process
+    do_query_parallel(block_ids, storage, pagination, search_filters)
   end
 
   @spec trace(String.t()) :: {:ok, [SpanStream.Span.t()]}
   def trace(trace_id) do
-    GenServer.call(__MODULE__, {:trace, trace_id}, SpanStream.Config.query_timeout())
+    # Phase 1: GenServer does the cheap SQLite lookup only
+    {block_info, storage} =
+      GenServer.call(__MODULE__, {:trace_plan, trace_id}, SpanStream.Config.query_timeout())
+
+    # Phase 2: Parallel decompression in the caller's process
+    do_trace_parallel(block_info, storage, trace_id)
   end
 
   @spec delete_blocks_before(integer()) :: non_neg_integer()
@@ -70,6 +94,8 @@ defmodule SpanStream.Index do
     GenServer.call(__MODULE__, {:compact_blocks, old_block_ids, new_meta, new_entries}, 60_000)
   end
 
+  # --- GenServer callbacks ---
+
   @impl true
   def init(opts) do
     storage = Keyword.get(opts, :storage, :disk)
@@ -88,46 +114,55 @@ defmodule SpanStream.Index do
       end
 
     create_tables(db)
-    {:ok, %{db: db, db_path: db_path, storage: storage}}
+
+    {:ok,
+     %{db: db, db_path: db_path, storage: storage, pending: [], flush_timer: nil}}
   end
 
   @impl true
-  def terminate(_reason, %{db: db}) do
-    Exqlite.Sqlite3.close(db)
+  def terminate(_reason, state) do
+    flush_pending(state)
+    Exqlite.Sqlite3.close(state.db)
   end
+
+  # --- handle_call (grouped) ---
 
   @impl true
   def handle_call({:index_block, meta, entries}, _from, state) do
+    state = flush_pending(state)
     result = do_index_block(state.db, meta, entries)
     {:reply, result, state}
   end
 
-  @impl true
-  def handle_call({:query, filters}, _from, state) do
-    result = do_query(state.db, state.storage, filters)
-    {:reply, result, state}
+  def handle_call({:query_plan, filters}, _from, state) do
+    state = flush_pending(state)
+    {search_filters, pagination} = split_pagination(filters)
+    {term_filters, time_filters} = split_filters(search_filters)
+    order = Keyword.get(pagination, :order, :desc)
+    block_ids = find_matching_blocks(state.db, term_filters, time_filters, order)
+    {:reply, {block_ids, state.storage, pagination, search_filters}, state}
   end
 
-  @impl true
-  def handle_call({:trace, trace_id}, _from, state) do
-    result = do_trace(state.db, state.storage, trace_id)
-    {:reply, result, state}
+  def handle_call({:trace_plan, trace_id}, _from, state) do
+    state = flush_pending(state)
+    block_info = find_trace_blocks(state.db, trace_id)
+    {:reply, {block_info, state.storage}, state}
   end
 
-  @impl true
   def handle_call({:delete_before, cutoff}, _from, state) do
+    state = flush_pending(state)
     count = do_delete_before(state.db, cutoff, state.storage)
     {:reply, count, state}
   end
 
-  @impl true
   def handle_call({:delete_over_size, max_bytes}, _from, state) do
+    state = flush_pending(state)
     count = do_delete_over_size(state.db, max_bytes, state.storage)
     {:reply, count, state}
   end
 
-  @impl true
   def handle_call({:matching_block_ids, filters}, _from, state) do
+    state = flush_pending(state)
     {search_filters, pagination} = split_pagination(filters)
     {term_filters, time_filters} = split_filters(search_filters)
     order = Keyword.get(pagination, :order, :asc)
@@ -135,35 +170,80 @@ defmodule SpanStream.Index do
     {:reply, block_ids, state}
   end
 
-  @impl true
   def handle_call(:stats, _from, state) do
+    state = flush_pending(state)
     result = do_stats(state.db, state.db_path)
     {:reply, result, state}
   end
 
-  @impl true
   def handle_call({:read_block_data, block_id}, _from, state) do
+    state = flush_pending(state)
     result = read_block_from_db(state.db, block_id)
     {:reply, result, state}
   end
 
-  @impl true
   def handle_call(:raw_block_stats, _from, state) do
+    state = flush_pending(state)
     result = do_raw_block_stats(state.db)
     {:reply, result, state}
   end
 
-  @impl true
   def handle_call(:raw_block_ids, _from, state) do
+    state = flush_pending(state)
     result = do_raw_block_ids(state.db)
     {:reply, result, state}
   end
 
-  @impl true
   def handle_call({:compact_blocks, old_ids, new_meta, new_entries}, _from, state) do
+    state = flush_pending(state)
     result = do_compact_blocks(state.db, old_ids, new_meta, new_entries, state.storage)
     {:reply, result, state}
   end
+
+  # --- handle_cast ---
+
+  @impl true
+  def handle_cast({:index_block, meta, entries}, state) do
+    pending = [{meta, entries} | state.pending]
+    state = schedule_index_flush(%{state | pending: pending})
+    {:noreply, state}
+  end
+
+  # --- handle_info ---
+
+  @impl true
+  def handle_info(:flush_index, state) do
+    state = %{state | flush_timer: nil}
+    state = flush_pending(state)
+    {:noreply, state}
+  end
+
+  # --- Pending flush helpers ---
+
+  defp flush_pending(%{pending: []} = state), do: state
+
+  defp flush_pending(%{pending: pending, db: db} = state) do
+    Exqlite.Sqlite3.execute(db, "BEGIN")
+
+    for {meta, entries} <- Enum.reverse(pending) do
+      index_block_inner(db, meta, entries)
+    end
+
+    Exqlite.Sqlite3.execute(db, "COMMIT")
+
+    if state.flush_timer do
+      Process.cancel_timer(state.flush_timer)
+    end
+
+    %{state | pending: [], flush_timer: nil}
+  end
+
+  defp schedule_index_flush(%{flush_timer: nil} = state) do
+    ref = Process.send_after(self(), :flush_index, @index_flush_interval)
+    %{state | flush_timer: ref}
+  end
+
+  defp schedule_index_flush(state), do: state
 
   # --- Table creation ---
 
@@ -217,10 +297,16 @@ defmodule SpanStream.Index do
   # --- Indexing ---
 
   defp do_index_block(db, meta, entries) do
+    Exqlite.Sqlite3.execute(db, "BEGIN")
+    index_block_inner(db, meta, entries)
+    Exqlite.Sqlite3.execute(db, "COMMIT")
+    :ok
+  end
+
+  # Index a single block's metadata + terms + traces (caller manages transaction)
+  defp index_block_inner(db, meta, entries) do
     format = Map.get(meta, :format, :zstd)
     format_str = Atom.to_string(format)
-
-    Exqlite.Sqlite3.execute(db, "BEGIN")
 
     {:ok, block_stmt} =
       Exqlite.Sqlite3.prepare(db, """
@@ -242,62 +328,83 @@ defmodule SpanStream.Index do
     Exqlite.Sqlite3.step(db, block_stmt)
     Exqlite.Sqlite3.release(db, block_stmt)
 
-    # Index terms
+    # Index terms (batched multi-value INSERT)
     terms = extract_terms(entries)
+    insert_terms_batch(db, terms, meta.block_id)
 
-    {:ok, term_stmt} =
-      Exqlite.Sqlite3.prepare(db, """
-      INSERT OR IGNORE INTO block_terms (term, block_id) VALUES (?1, ?2)
-      """)
-
-    for term <- terms do
-      Exqlite.Sqlite3.bind(term_stmt, [term, meta.block_id])
-      Exqlite.Sqlite3.step(db, term_stmt)
-      Exqlite.Sqlite3.reset(term_stmt)
-    end
-
-    Exqlite.Sqlite3.release(db, term_stmt)
-
-    # Index trace data
-    index_trace_data(db, meta.block_id, entries)
-
-    Exqlite.Sqlite3.execute(db, "COMMIT")
-    :ok
+    # Index trace data (batched multi-value INSERT)
+    index_trace_data_batch(db, meta.block_id, entries)
   end
 
-  defp index_trace_data(db, block_id, entries) do
-    # Group spans by trace_id
+  defp insert_terms_batch(_db, [], _block_id), do: :ok
+
+  defp insert_terms_batch(db, terms, block_id) do
+    terms
+    |> Enum.chunk_every(@terms_batch_size)
+    |> Enum.each(fn batch ->
+      n = length(batch)
+
+      placeholders =
+        Enum.map_join(1..n, ", ", fn i ->
+          "(?#{i * 2 - 1}, ?#{i * 2})"
+        end)
+
+      sql = "INSERT OR IGNORE INTO block_terms (term, block_id) VALUES #{placeholders}"
+      {:ok, stmt} = Exqlite.Sqlite3.prepare(db, sql)
+      params = Enum.flat_map(batch, fn term -> [term, block_id] end)
+      Exqlite.Sqlite3.bind(stmt, params)
+      Exqlite.Sqlite3.step(db, stmt)
+      Exqlite.Sqlite3.release(db, stmt)
+    end)
+  end
+
+  defp index_trace_data_batch(db, block_id, entries) do
     by_trace = Enum.group_by(entries, & &1.trace_id)
 
-    {:ok, stmt} =
-      Exqlite.Sqlite3.prepare(db, """
-      INSERT OR REPLACE INTO trace_index (trace_id, block_id, span_count, root_span_name, duration_ns, has_error)
-      VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-      """)
+    trace_rows =
+      Enum.map(by_trace, fn {trace_id, spans} ->
+        root = Enum.find(spans, fn s -> s.parent_span_id == nil end) || hd(spans)
+        has_error = if Enum.any?(spans, fn s -> s.status == :error end), do: 1, else: 0
 
-    for {trace_id, spans} <- by_trace do
-      root = Enum.find(spans, fn s -> s.parent_span_id == nil end) || hd(spans)
-      has_error = if Enum.any?(spans, fn s -> s.status == :error end), do: 1, else: 0
+        # Single-pass min start / max end / count
+        {min_start, max_end, count} =
+          Enum.reduce(spans, {nil, nil, 0}, fn s, {mn, mx, c} ->
+            {
+              if(mn == nil or s.start_time < mn, do: s.start_time, else: mn),
+              if(mx == nil or s.end_time > mx, do: s.end_time, else: mx),
+              c + 1
+            }
+          end)
 
-      # Trace duration: from earliest start to latest end
-      min_start = spans |> Enum.map(& &1.start_time) |> Enum.min()
-      max_end = spans |> Enum.map(& &1.end_time) |> Enum.max()
-      duration_ns = max_end - min_start
+        duration_ns = max_end - min_start
+        {trace_id, count, to_string(root.name), duration_ns, has_error}
+      end)
 
-      Exqlite.Sqlite3.bind(stmt, [
-        trace_id,
-        block_id,
-        length(spans),
-        to_string(root.name),
-        duration_ns,
-        has_error
-      ])
+    trace_rows
+    |> Enum.chunk_every(@trace_batch_size)
+    |> Enum.each(fn batch ->
+      n = length(batch)
 
+      placeholders =
+        Enum.map_join(1..n, ", ", fn i ->
+          base = (i - 1) * 6
+          "(?#{base + 1}, ?#{base + 2}, ?#{base + 3}, ?#{base + 4}, ?#{base + 5}, ?#{base + 6})"
+        end)
+
+      sql =
+        "INSERT OR REPLACE INTO trace_index (trace_id, block_id, span_count, root_span_name, duration_ns, has_error) VALUES #{placeholders}"
+
+      {:ok, stmt} = Exqlite.Sqlite3.prepare(db, sql)
+
+      params =
+        Enum.flat_map(batch, fn {trace_id, count, root_name, dur, err} ->
+          [trace_id, block_id, count, root_name, dur, err]
+        end)
+
+      Exqlite.Sqlite3.bind(stmt, params)
       Exqlite.Sqlite3.step(db, stmt)
-      Exqlite.Sqlite3.reset(stmt)
-    end
-
-    Exqlite.Sqlite3.release(db, stmt)
+      Exqlite.Sqlite3.release(db, stmt)
+    end)
   end
 
   defp extract_terms(entries) do
@@ -333,45 +440,70 @@ defmodule SpanStream.Index do
     |> Enum.uniq()
   end
 
-  # --- Querying ---
+  # --- Querying (parallel, runs in caller's process) ---
 
-  defp do_query(db, storage, filters) do
+  defp do_query_parallel(block_ids, storage, pagination, search_filters) do
     start_time = System.monotonic_time()
-    {search_filters, pagination} = split_pagination(filters)
-    {term_filters, time_filters} = split_filters(search_filters)
 
     limit = Keyword.get(pagination, :limit, @default_limit)
     offset = Keyword.get(pagination, :offset, @default_offset)
     order = Keyword.get(pagination, :order, :desc)
-
-    block_ids = find_matching_blocks(db, term_filters, time_filters, order)
     blocks_read = length(block_ids)
 
     all_matching =
-      Enum.flat_map(block_ids, fn {block_id, file_path, format} ->
-        format_atom = to_format_atom(format)
+      if storage == :disk and blocks_read > 1 do
+        block_ids
+        |> Task.async_stream(
+          fn {_block_id, file_path, format} ->
+            format_atom = to_format_atom(format)
 
-        read_result =
-          case storage do
-            :disk -> SpanStream.Writer.read_block(file_path, format_atom)
-            :memory -> read_block_from_db(db, block_id)
+            case SpanStream.Writer.read_block(file_path, format_atom) do
+              {:ok, entries} ->
+                entries
+                |> SpanStream.Filter.filter(search_filters)
+                |> Enum.map(&SpanStream.Span.from_map/1)
+
+              {:error, reason} ->
+                SpanStream.Telemetry.event(
+                  [:span_stream, :block, :error],
+                  %{},
+                  %{file_path: file_path, reason: reason}
+                )
+
+                []
+            end
+          end,
+          max_concurrency: System.schedulers_online(),
+          ordered: false
+        )
+        |> Enum.flat_map(fn {:ok, entries} -> entries end)
+      else
+        Enum.flat_map(block_ids, fn {block_id, file_path, format} ->
+          format_atom = to_format_atom(format)
+
+          read_result =
+            case storage do
+              :disk -> SpanStream.Writer.read_block(file_path, format_atom)
+              :memory -> read_block_data(block_id)
+            end
+
+          case read_result do
+            {:ok, entries} ->
+              entries
+              |> SpanStream.Filter.filter(search_filters)
+              |> Enum.map(&SpanStream.Span.from_map/1)
+
+            {:error, reason} ->
+              SpanStream.Telemetry.event(
+                [:span_stream, :block, :error],
+                %{},
+                %{file_path: file_path, reason: reason}
+              )
+
+              []
           end
-
-        case read_result do
-          {:ok, entries} ->
-            filtered = SpanStream.Filter.filter(entries, search_filters)
-            Enum.map(filtered, &SpanStream.Span.from_map/1)
-
-          {:error, reason} ->
-            SpanStream.Telemetry.event(
-              [:span_stream, :block, :error],
-              %{},
-              %{file_path: file_path, reason: reason}
-            )
-
-            []
-        end
-      end)
+        end)
+      end
 
     sorted =
       case order do
@@ -386,7 +518,7 @@ defmodule SpanStream.Index do
     SpanStream.Telemetry.event(
       [:span_stream, :query, :stop],
       %{duration: duration, total: total, blocks_read: blocks_read},
-      %{filters: filters}
+      %{filters: search_filters}
     )
 
     {:ok,
@@ -398,52 +530,64 @@ defmodule SpanStream.Index do
      }}
   end
 
-  defp do_trace(db, storage, trace_id) do
-    # Find blocks containing this trace via trace_index
+  defp find_trace_blocks(db, trace_id) do
     {:ok, stmt} =
       Exqlite.Sqlite3.prepare(db, """
-      SELECT block_id FROM trace_index WHERE trace_id = ?1
+      SELECT ti.block_id, b.file_path, b.format
+      FROM trace_index ti
+      JOIN blocks b ON ti.block_id = b.block_id
+      WHERE ti.trace_id = ?1
       """)
 
     Exqlite.Sqlite3.bind(stmt, [trace_id])
-    block_ids = collect_single_col(db, stmt)
+    rows = collect_rows_3(db, stmt)
     Exqlite.Sqlite3.release(db, stmt)
+    rows
+  end
 
-    # Read each block and extract spans for this trace
+  defp do_trace_parallel(block_info, storage, trace_id) do
     spans =
-      Enum.flat_map(block_ids, fn block_id ->
-        # Get block metadata for format
-        {:ok, meta_stmt} =
-          Exqlite.Sqlite3.prepare(db, "SELECT file_path, format FROM blocks WHERE block_id = ?1")
+      if storage == :disk and length(block_info) > 1 do
+        block_info
+        |> Task.async_stream(
+          fn {_block_id, file_path, format} ->
+            format_atom = to_format_atom(format)
 
-        Exqlite.Sqlite3.bind(meta_stmt, [block_id])
+            case SpanStream.Writer.read_block(file_path, format_atom) do
+              {:ok, entries} ->
+                entries
+                |> Enum.filter(fn e -> e.trace_id == trace_id end)
+                |> Enum.map(&SpanStream.Span.from_map/1)
 
-        {file_path, format} =
-          case Exqlite.Sqlite3.step(db, meta_stmt) do
-            {:row, [fp, fmt]} -> {fp, fmt}
-            :done -> {nil, "raw"}
+              {:error, _} ->
+                []
+            end
+          end,
+          max_concurrency: System.schedulers_online(),
+          ordered: false
+        )
+        |> Enum.flat_map(fn {:ok, entries} -> entries end)
+      else
+        Enum.flat_map(block_info, fn {block_id, file_path, format} ->
+          format_atom = to_format_atom(format)
+
+          read_result =
+            case storage do
+              :disk -> SpanStream.Writer.read_block(file_path, format_atom)
+              :memory -> read_block_data(block_id)
+            end
+
+          case read_result do
+            {:ok, entries} ->
+              entries
+              |> Enum.filter(fn e -> e.trace_id == trace_id end)
+              |> Enum.map(&SpanStream.Span.from_map/1)
+
+            {:error, _} ->
+              []
           end
-
-        Exqlite.Sqlite3.release(db, meta_stmt)
-
-        format_atom = to_format_atom(format)
-
-        read_result =
-          case storage do
-            :disk -> SpanStream.Writer.read_block(file_path, format_atom)
-            :memory -> read_block_from_db(db, block_id)
-          end
-
-        case read_result do
-          {:ok, entries} ->
-            entries
-            |> Enum.filter(fn e -> e.trace_id == trace_id end)
-            |> Enum.map(&SpanStream.Span.from_map/1)
-
-          {:error, _} ->
-            []
-        end
-      end)
+        end)
+      end
 
     {:ok, Enum.sort_by(spans, & &1.start_time)}
   end
@@ -638,23 +782,10 @@ defmodule SpanStream.Index do
     Exqlite.Sqlite3.step(db, block_stmt)
     Exqlite.Sqlite3.release(db, block_stmt)
 
+    # Batched term + trace indexing for new block
     terms = extract_terms(new_entries)
-
-    {:ok, term_stmt} =
-      Exqlite.Sqlite3.prepare(db, """
-      INSERT OR IGNORE INTO block_terms (term, block_id) VALUES (?1, ?2)
-      """)
-
-    for term <- terms do
-      Exqlite.Sqlite3.bind(term_stmt, [term, new_meta.block_id])
-      Exqlite.Sqlite3.step(db, term_stmt)
-      Exqlite.Sqlite3.reset(term_stmt)
-    end
-
-    Exqlite.Sqlite3.release(db, term_stmt)
-
-    # Re-index trace data for new block
-    index_trace_data(db, new_meta.block_id, new_entries)
+    insert_terms_batch(db, terms, new_meta.block_id)
+    index_trace_data_batch(db, new_meta.block_id, new_entries)
 
     Exqlite.Sqlite3.execute(db, "COMMIT")
 
@@ -834,13 +965,6 @@ defmodule SpanStream.Index do
   defp to_format_atom(_), do: :zstd
 
   # --- Row collectors ---
-
-  defp collect_single_col(db, stmt) do
-    case Exqlite.Sqlite3.step(db, stmt) do
-      {:row, [val]} -> [val | collect_single_col(db, stmt)]
-      :done -> []
-    end
-  end
 
   defp collect_rows_2(db, stmt) do
     case Exqlite.Sqlite3.step(db, stmt) do

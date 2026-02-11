@@ -24,26 +24,27 @@ defmodule SpanStream.Buffer do
     interval = SpanStream.Config.flush_interval()
     schedule_flush(interval)
 
-    {:ok, %{buffer: [], data_dir: data_dir, flush_interval: interval}}
+    {:ok, %{buffer: [], buffer_size: 0, data_dir: data_dir, flush_interval: interval}}
   end
 
   @impl true
   def handle_cast({:ingest, spans}, state) do
-    for span <- spans, do: broadcast_to_subscribers(span)
+    broadcast_to_subscribers(spans)
     buffer = Enum.reverse(spans) ++ state.buffer
+    size = state.buffer_size + length(spans)
 
-    if length(buffer) >= SpanStream.Config.max_buffer_size() do
+    if size >= SpanStream.Config.max_buffer_size() do
       do_flush(buffer, state.data_dir)
-      {:noreply, %{state | buffer: []}}
+      {:noreply, %{state | buffer: [], buffer_size: 0}}
     else
-      {:noreply, %{state | buffer: buffer}}
+      {:noreply, %{state | buffer: buffer, buffer_size: size}}
     end
   end
 
   @impl true
   def handle_call(:flush, _from, state) do
-    do_flush(state.buffer, state.data_dir)
-    {:reply, :ok, %{state | buffer: []}}
+    do_flush(state.buffer, state.data_dir, sync: true)
+    {:reply, :ok, %{state | buffer: [], buffer_size: 0}}
   end
 
   @impl true
@@ -53,12 +54,13 @@ defmodule SpanStream.Buffer do
     end
 
     schedule_flush(state.flush_interval)
-    {:noreply, %{state | buffer: []}}
+    {:noreply, %{state | buffer: [], buffer_size: 0}}
   end
 
-  defp do_flush([], _data_dir), do: :ok
+  defp do_flush(buffer, data_dir, opts \\ [])
+  defp do_flush([], _data_dir, _opts), do: :ok
 
-  defp do_flush(buffer, data_dir) do
+  defp do_flush(buffer, data_dir, opts) do
     entries = Enum.reverse(buffer)
     start_time = System.monotonic_time()
 
@@ -66,7 +68,12 @@ defmodule SpanStream.Buffer do
 
     case SpanStream.Writer.write_block(entries, write_target, :raw) do
       {:ok, block_meta} ->
-        SpanStream.Index.index_block(block_meta, entries)
+        if Keyword.get(opts, :sync, false) do
+          SpanStream.Index.index_block(block_meta, entries)
+        else
+          SpanStream.Index.index_block_async(block_meta, entries)
+        end
+
         duration = System.monotonic_time() - start_time
 
         SpanStream.Telemetry.event(
@@ -88,16 +95,24 @@ defmodule SpanStream.Buffer do
     Process.send_after(self(), :flush_timer, interval)
   end
 
-  defp broadcast_to_subscribers(span) do
-    span_struct = SpanStream.Span.from_map(span)
+  defp broadcast_to_subscribers(spans) do
+    case Registry.count_match(SpanStream.Registry, :spans, :_) do
+      0 ->
+        :ok
 
-    Registry.dispatch(SpanStream.Registry, :spans, fn subscribers ->
-      for {pid, opts} <- subscribers do
-        if matches_subscription?(span, opts) do
-          send(pid, {:span_stream, :span, span_struct})
+      _n ->
+        for span <- spans do
+          span_struct = SpanStream.Span.from_map(span)
+
+          Registry.dispatch(SpanStream.Registry, :spans, fn subscribers ->
+            for {pid, opts} <- subscribers do
+              if matches_subscription?(span, opts) do
+                send(pid, {:span_stream, :span, span_struct})
+              end
+            end
+          end)
         end
-      end
-    end)
+    end
   end
 
   defp matches_subscription?(_span, []), do: true
