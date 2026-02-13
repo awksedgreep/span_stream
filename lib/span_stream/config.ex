@@ -61,4 +61,9 @@ defmodule SpanStream.Config do
   def compaction_max_raw_age do
     Application.get_env(:span_stream, :compaction_max_raw_age, 60)
   end
+
+  @spec compression_level() :: 1..22
+  def compression_level do
+    Application.get_env(:span_stream, :compression_level, 9)
+  end
 end

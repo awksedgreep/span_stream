@@ -13,17 +13,23 @@ defmodule SpanStream.Writer do
           format: :raw | :zstd
         }
 
-  @spec write_block([map()], String.t() | :memory, :raw | :zstd) ::
+  @spec write_block([map()], String.t() | :memory, :raw | :zstd, keyword()) ::
           {:ok, block_meta()} | {:error, term()}
-  def write_block(entries, target, format \\ :raw)
+  def write_block(entries, target, format \\ :raw, opts \\ [])
 
-  def write_block(entries, :memory, format) do
+  def write_block(entries, :memory, format, opts) do
     binary = :erlang.term_to_binary(entries)
 
     data =
       case format do
-        :raw -> binary
-        :zstd -> :ezstd.compress(binary)
+        :raw ->
+          binary
+
+        :zstd ->
+          :ezstd.compress(
+            binary,
+            Keyword.get(opts, :level, SpanStream.Config.compression_level())
+          )
       end
 
     block_id = System.unique_integer([:positive, :monotonic])
@@ -43,13 +49,19 @@ defmodule SpanStream.Writer do
     {:ok, meta}
   end
 
-  def write_block(entries, data_dir, format) do
+  def write_block(entries, data_dir, format, opts) do
     binary = :erlang.term_to_binary(entries)
 
     {data, ext} =
       case format do
-        :raw -> {binary, "raw"}
-        :zstd -> {:ezstd.compress(binary), "zst"}
+        :raw ->
+          {binary, "raw"}
+
+        :zstd ->
+          {:ezstd.compress(
+             binary,
+             Keyword.get(opts, :level, SpanStream.Config.compression_level())
+           ), "zst"}
       end
 
     block_id = System.unique_integer([:positive, :monotonic])

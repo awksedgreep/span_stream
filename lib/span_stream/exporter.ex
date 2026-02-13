@@ -45,9 +45,8 @@ defmodule SpanStream.Exporter do
       #    attributes, events, links, status, trace_flags,
       #    is_recording, instrumentation_scope}
       case record do
-        {:span, trace_id, span_id, _tracestate, parent_span_id, _parent_span_is_remote,
-         name, kind, start_time, end_time,
-         attributes, events, links, status, _trace_flags,
+        {:span, trace_id, span_id, _tracestate, parent_span_id, _parent_span_is_remote, name,
+         kind, start_time, end_time, attributes, events, links, status, _trace_flags,
          _is_recording, instrumentation_scope} ->
           %{
             trace_id: SpanStream.Span.encode_trace_id(trace_id),
