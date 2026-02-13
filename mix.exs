@@ -4,7 +4,7 @@ defmodule SpanStream.MixProject do
   def project do
     [
       app: :span_stream,
-      version: "0.1.2",
+      version: "0.2.0",
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
@@ -29,6 +29,9 @@ defmodule SpanStream.MixProject do
       {:ezstd, "~> 1.2"},
       {:opentelemetry_api, "~> 1.4"},
       {:opentelemetry, "~> 1.5"},
+      {:bandit, "~> 1.6"},
+      {:plug, "~> 1.16"},
+      {:jason, "~> 1.4"},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false}
     ]
   end

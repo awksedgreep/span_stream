@@ -72,6 +72,32 @@ defmodule SpanStream do
   end
 
   @doc """
+  List all distinct service names found in stored spans.
+
+  ## Examples
+
+      {:ok, services} = SpanStream.services()
+      #=> {:ok, ["my_app", "api_gateway", "auth_service"]}
+  """
+  @spec services() :: {:ok, [String.t()]}
+  def services do
+    SpanStream.Index.distinct_services()
+  end
+
+  @doc """
+  List all distinct operation (span) names for a given service.
+
+  ## Examples
+
+      {:ok, ops} = SpanStream.operations("my_app")
+      #=> {:ok, ["GET /users", "DB query", "cache_lookup"]}
+  """
+  @spec operations(String.t()) :: {:ok, [String.t()]}
+  def operations(service) do
+    SpanStream.Index.distinct_operations(service)
+  end
+
+  @doc """
   Flush the buffer, writing any pending spans to storage immediately.
   """
   @spec flush() :: :ok

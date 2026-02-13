@@ -99,6 +99,16 @@ defmodule SpanStream.Index do
     GenServer.call(__MODULE__, {:backup, target_path}, :infinity)
   end
 
+  @spec distinct_services() :: {:ok, [String.t()]}
+  def distinct_services do
+    GenServer.call(__MODULE__, :distinct_services, SpanStream.Config.query_timeout())
+  end
+
+  @spec distinct_operations(String.t()) :: {:ok, [String.t()]}
+  def distinct_operations(service) do
+    GenServer.call(__MODULE__, {:distinct_operations, service}, SpanStream.Config.query_timeout())
+  end
+
   # --- GenServer callbacks ---
 
   @impl true
@@ -215,6 +225,18 @@ defmodule SpanStream.Index do
       :done -> {:reply, :ok, state}
       {:error, _} = err -> {:reply, err, state}
     end
+  end
+
+  def handle_call(:distinct_services, _from, state) do
+    state = flush_pending(state)
+    result = do_distinct_services(state.db)
+    {:reply, result, state}
+  end
+
+  def handle_call({:distinct_operations, service}, _from, state) do
+    state = flush_pending(state)
+    result = do_distinct_operations(state.db, service)
+    {:reply, result, state}
   end
 
   # --- handle_cast ---
@@ -980,6 +1002,44 @@ defmodule SpanStream.Index do
   defp to_format_atom(:raw), do: :raw
   defp to_format_atom(:zstd), do: :zstd
   defp to_format_atom(_), do: :zstd
+
+  # --- Service/operation discovery ---
+
+  defp do_distinct_services(db) do
+    {:ok, stmt} =
+      Exqlite.Sqlite3.prepare(db, """
+      SELECT DISTINCT substr(term, 14) FROM block_terms
+      WHERE term LIKE 'service.name:%'
+      ORDER BY substr(term, 14)
+      """)
+
+    services = collect_single_column(db, stmt)
+    Exqlite.Sqlite3.release(db, stmt)
+    {:ok, services}
+  end
+
+  defp do_distinct_operations(db, service) do
+    # Find blocks that contain this service, then get span names from those blocks
+    {:ok, stmt} =
+      Exqlite.Sqlite3.prepare(db, """
+      SELECT DISTINCT substr(bt2.term, 6) FROM block_terms bt1
+      JOIN block_terms bt2 ON bt1.block_id = bt2.block_id
+      WHERE bt1.term = ?1 AND bt2.term LIKE 'name:%'
+      ORDER BY substr(bt2.term, 6)
+      """)
+
+    Exqlite.Sqlite3.bind(stmt, ["service.name:#{service}"])
+    operations = collect_single_column(db, stmt)
+    Exqlite.Sqlite3.release(db, stmt)
+    {:ok, operations}
+  end
+
+  defp collect_single_column(db, stmt) do
+    case Exqlite.Sqlite3.step(db, stmt) do
+      {:row, [value]} -> [value | collect_single_column(db, stmt)]
+      :done -> []
+    end
+  end
 
   # --- Row collectors ---
 
